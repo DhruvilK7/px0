@@ -18,11 +18,14 @@ const closedTabs = [];
 const MAX_CLOSED = 20;
 
 export async function openFile(path, opts = {}) {
-  const { line, push = true, col } = opts;
+  const { line, push = true, col, reload = false } = opts;
   let idx = S.tabs.findIndex(t => t.path === path);
-  if (idx < 0) {
+  // On reload keep where the reader was: anchor the fetch and restore scroll/caret.
+  const keep = (reload && idx >= 0) ? S.tabs[idx] : null;
+  if (idx < 0 || reload) {
     let j;
-    const start = line ? Math.max(0, Math.floor((line - 1) / CHUNK) * CHUNK) : 0;
+    const anchor = keep ? keep.cur : line;
+    const start = anchor ? Math.max(0, Math.floor((anchor - 1) / CHUNK) * CHUNK) : 0;
     try {
       j = await api('/api/file', { path, start, count: CHUNK });
     } catch (e) {
@@ -36,13 +39,14 @@ export async function openFile(path, opts = {}) {
     const d = {
       path, name: path.split('/').pop(), lang: j.lang, total: j.total, maxCols: j.maxCols,
       size: j.size, lines: new Array(j.total), chunks: new Set([start / CHUNK]),
-      pending: new Set(), refining: new Set(), scrollTop: 0, cur: line || 1,
+      pending: new Set(), refining: new Set(),
+      scrollTop: keep ? keep.scrollTop : 0, cur: keep ? keep.cur : (line || 1),
       outline: null, gen: 0, markdown: !!j.markdown,
     };
     for (let i = 0; i < j.lines.length; i++) d.lines[j.start + i] = j.lines[i];
     d.lsp = j.lsp || { state: 'off', server: '' };
-    S.tabs.push(d);
-    idx = S.tabs.length - 1;
+    if (idx < 0) { S.tabs.push(d); idx = S.tabs.length - 1; }
+    else S.tabs[idx] = d; // reload: replace stale doc in place, keep tab order
     if (j.refine) refineChunk(d, start / CHUNK);
   }
   const prev = doc_();
