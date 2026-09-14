@@ -12,6 +12,7 @@ import { clearLink } from './hover.js';
 import { clearFind } from './find.js';
 import { clearSelectAll } from './selbar.js';
 import { syncPreview, previewing, previewLine } from './markdown.js';
+import { syncDiffView } from './diff.js';
 
 // Recently closed files, newest last, for Alt+Shift+T.
 const closedTabs = [];
@@ -41,13 +42,15 @@ export async function openFile(path, opts = {}) {
       size: j.size, lines: new Array(j.total), chunks: new Set([start / CHUNK]),
       pending: new Set(), refining: new Set(),
       scrollTop: keep ? keep.scrollTop : 0, cur: keep ? keep.cur : (line || 1),
-      outline: null, gen: 0, markdown: !!j.markdown,
+      outline: null, gen: 0, markdown: !!j.markdown, gutter: null,
+      diffMode: null, diffAvailable: false,
     };
     for (let i = 0; i < j.lines.length; i++) d.lines[j.start + i] = j.lines[i];
     d.lsp = j.lsp || { state: 'off', server: '' };
     if (idx < 0) { S.tabs.push(d); idx = S.tabs.length - 1; }
     else S.tabs[idx] = d; // reload: replace stale doc in place, keep tab order
     if (j.refine) refineChunk(d, start / CHUNK);
+    loadGutter(d);
   }
   const prev = doc_();
   if (prev && prev !== S.tabs[idx]) prev.scrollTop = vp.scrollTop;
@@ -58,6 +61,7 @@ export async function openFile(path, opts = {}) {
   $('#empty').hidden = true;
   hideImage();
   syncPreview();
+  syncDiffView();
   if (!S.at || S.at.path !== d.path) S.at = null;
   S.lsp.state = (d.lsp && d.lsp.state) || 'off';
   S.lsp.server = (d.lsp && d.lsp.server) || '';
@@ -71,6 +75,25 @@ export async function openFile(path, opts = {}) {
   updateStatus();
   if ($('#panel-outline')?.classList.contains('active')) loadOutline();
   if (push) pushHistory(path, line || d.cur, col);
+}
+
+// VS Code-style diff gutter for the normal file view. Fetches once per opened
+// doc and caches on it (each tab keeps its own; switching tabs needs no clear).
+// Fetches on any open in a git repo rather than threading per-file status
+// through every open path — the backend returns available:false for
+// clean/untracked files, so the extra request is cheap and self-limiting.
+function loadGutter(d) {
+  if (!S.meta?.git) return;
+  api('/api/gutter', { path: d.path }).then(j => {
+    d.diffAvailable = !!j.available;
+    if (doc_() === d) updateStatus();
+    if (!j.available) return;
+    const marks = new Map();
+    for (const n of j.modified) marks.set(n, 'mod');
+    for (const n of j.added) marks.set(n, 'add');
+    d.gutter = { marks, dels: new Set(j.deleted) };
+    if (doc_() === d) render();
+  }).catch(() => {});
 }
 
 export function centerLine(n) {
@@ -102,6 +125,7 @@ export function closeTab(i) {
   if (S.tabs.length === 0) {
     S.active = -1;
     syncPreview();
+    syncDiffView();
     rowsEl.innerHTML = ''; sizer.style.height = '0px';
     $('#empty').hidden = false; drawCrumbs();
     drawTabs(); updateStatus();
@@ -110,6 +134,7 @@ export function closeTab(i) {
   S.active = Math.min(i, S.tabs.length - 1);
   const d = doc_();
   syncPreview();
+  syncDiffView();
   drawTabs(); drawCrumbs(); layout();
   vp.scrollTop = d.scrollTop; render(); updateStatus();
 }
@@ -142,6 +167,7 @@ export function switchTab(i) {
   if (prev) prev.scrollTop = vp.scrollTop;
   S.active = i;
   syncPreview();
+  syncDiffView();
   clearFind();
   clearSelectAll();
   S.at = null;

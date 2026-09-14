@@ -24,16 +24,18 @@ var version = strings.TrimSpace(rawVersion)
 
 func main() {
 	var (
-		port    = flag.Int("port", 7777, "port to listen on (0 picks a free one)")
-		host    = flag.String("host", "127.0.0.1", "address to bind")
-		noOpen  = flag.Bool("no-open", false, "do not launch a browser")
-		noLSP   = flag.Bool("no-lsp", false, "do not use language servers, even if installed")
-		dev     = flag.String("dev", "", "serve the UI from this source directory instead of the embedded copy")
-		showVer = flag.Bool("version", false, "print version and exit")
+		port         = flag.Int("port", 7777, "port to listen on (0 picks a free one)")
+		host         = flag.String("host", "127.0.0.1", "address to bind")
+		noOpen       = flag.Bool("no-open", false, "do not launch a browser")
+		noLSP        = flag.Bool("no-lsp", false, "do not use language servers, even if installed")
+		noGit        = flag.Bool("no-git", false, "disable git awareness")
+		dev          = flag.String("dev", "", "serve the UI from this source directory instead of the embedded copy")
+		showVer      = flag.Bool("version", false, "print version and exit")
 		showVerShort = flag.Bool("v", false, "print version and exit (shorthand)")
-		doUpdate = flag.Bool("update", false, "check for and install latest version of px0")
-		noColor = flag.Bool("no-color", false, "disable colour output")
-		quiet   = flag.Bool("quiet", false, "suppress narration")
+		doUpdate     = flag.Bool("update", false, "check for and install latest version of px0")
+		noColor      = flag.Bool("no-color", false, "disable colour output")
+		quiet        = flag.Bool("quiet", false, "suppress narration")
+		noTelemetry  = flag.Bool("no-telemetry", false, "disable anonymous usage telemetry")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "px0 %s - a code navigator\n\nusage: px0 [flags] [directory]\n\nflags:\n", version)
@@ -47,6 +49,9 @@ func main() {
 	}
 	if *quiet {
 		uiQuiet = true
+	}
+	if *noGit {
+		gitDisabled = true
 	}
 
 	if *showVer || *showVerShort || (flag.NArg() == 1 && flag.Arg(0) == "version") {
@@ -90,6 +95,8 @@ func main() {
 
 	ix := NewIndex(root)
 	lsp := newLSPManager(root, !*noLSP)
+	tel := NewTelemetryService(*noTelemetry)
+	defer tel.Close("normal")
 
 	srv := &http.Server{Handler: NewServer(ix, lsp)}
 
@@ -112,6 +119,13 @@ func main() {
 		if names := lsp.Available(); len(names) > 0 {
 			uiBullet(fmt.Sprintf("language servers: %s (started on first use)", strings.Join(names, ", ")), os.Stdout)
 		}
+
+		tel.Track("session_started", map[string]any{
+			"files_bucket": filesBucket(n),
+			"index_ms":     ms,
+			"has_git":      gitAvailable(root),
+			"has_lsp":      len(lsp.Available()) > 0,
+		})
 	}()
 
 	// Check for updates asynchronously once a day without delaying startup (<1ms).
@@ -119,24 +133,35 @@ func main() {
 
 	// Language servers are children that can hold gigabytes. Shut them down on
 	// the way out rather than leaving them for the OS to reap.
+	interrupted := false
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-stop
+		interrupted = true
 		fmt.Print("\r")
 		uiStatus("warn", "interrupted", "", 0, os.Stderr)
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		go func() {
+			<-stop // Second interrupt forces immediate exit
+			os.Exit(130)
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		srv.Shutdown(ctx)
-		lsp.Close()
-		os.Exit(130)
+		_ = srv.Shutdown(ctx)
 	}()
 
-	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-		lsp.Close()
+	err = srv.Serve(ln)
+	lsp.Close()
+
+	if interrupted {
+		tel.Close("interrupted")
+		os.Exit(130)
+	}
+
+	tel.Close("normal")
+	if err != nil && err != http.ErrServerClosed {
 		fatal(err)
 	}
-	lsp.Close()
 }
 
 // listen binds the requested port, walking forward if it is already taken so a
