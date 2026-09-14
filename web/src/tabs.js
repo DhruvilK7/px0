@@ -19,14 +19,11 @@ const closedTabs = [];
 const MAX_CLOSED = 20;
 
 export async function openFile(path, opts = {}) {
-  const { line, push = true, col, reload = false } = opts;
+  const { line, push = true, col } = opts;
   let idx = S.tabs.findIndex(t => t.path === path);
-  // On reload keep where the reader was: anchor the fetch and restore scroll/caret.
-  const keep = (reload && idx >= 0) ? S.tabs[idx] : null;
-  if (idx < 0 || reload) {
+  if (idx < 0) {
     let j;
-    const anchor = keep ? keep.cur : line;
-    const start = anchor ? Math.max(0, Math.floor((anchor - 1) / CHUNK) * CHUNK) : 0;
+    const start = line ? Math.max(0, Math.floor((line - 1) / CHUNK) * CHUNK) : 0;
     try {
       j = await api('/api/file', { path, start, count: CHUNK });
     } catch (e) {
@@ -41,8 +38,7 @@ export async function openFile(path, opts = {}) {
     const d = {
       path, name: path.split('/').pop(), lang: j.lang, total: j.total, maxCols: j.maxCols,
       size: j.size, lines: new Array(j.total), chunks: new Set([start / CHUNK]),
-      pending: new Set(), refining: new Set(),
-      scrollTop: keep ? keep.scrollTop : 0, cur: keep ? keep.cur : (line || 1),
+      pending: new Set(), refining: new Set(), scrollTop: 0, cur: line || 1,
       outline: null, gen: 0, markdown: !!j.markdown, gutter: null,
       diffMode: hasDiff ? (layoutPref() || 'split') : null,
       diffAvailable: hasDiff,
@@ -50,8 +46,8 @@ export async function openFile(path, opts = {}) {
     };
     for (let i = 0; i < j.lines.length; i++) d.lines[j.start + i] = j.lines[i];
     d.lsp = j.lsp || { state: 'off', server: '' };
-    if (idx < 0) { S.tabs.push(d); idx = S.tabs.length - 1; }
-    else S.tabs[idx] = d; // reload: replace stale doc in place, keep tab order
+    S.tabs.push(d);
+    idx = S.tabs.length - 1;
     if (j.refine) refineChunk(d, start / CHUNK);
     loadGutter(d);
   }
@@ -104,6 +100,115 @@ function loadGutter(d) {
     d.gutter = { marks, dels: new Set(j.deleted) };
     if (doc_() === d) render();
   }).catch(() => {});
+}
+
+// Quietly re-fetches all open tabs on workspace reindex without tab-switching thrash.
+// Preserves live scroll position, cursor column/line (clamped), diff settings, and markdown scroll.
+export async function reloadOpenTabs() {
+  if (S.tabs.length === 0) return;
+
+  const activeDoc = doc_();
+  if (activeDoc) {
+    activeDoc.scrollTop = vp.scrollTop;
+    if (previewing(activeDoc)) {
+      const mv = $('#mdview');
+      if (mv) activeDoc.mdScroll = mv.scrollTop;
+    }
+  }
+
+  const targets = S.tabs.map(t => ({
+    oldDoc: t,
+    path: t.path,
+    anchor: t.cur || 1,
+    start: t.cur ? Math.max(0, Math.floor((t.cur - 1) / CHUNK) * CHUNK) : 0,
+  }));
+
+  const results = await Promise.allSettled(
+    targets.map(tgt => api('/api/file', { path: tgt.path, start: tgt.start, count: CHUNK }))
+  );
+
+  for (let i = 0; i < targets.length; i++) {
+    const res = results[i];
+    const tgt = targets[i];
+    const idx = S.tabs.indexOf(tgt.oldDoc);
+    if (idx < 0) continue; // tab closed while reloading
+
+    if (res.status !== 'fulfilled') {
+      if (idx === S.active) {
+        setStatusNote(tgt.path + ': ' + (res.reason?.message || 'failed to load'));
+      }
+      continue;
+    }
+
+    const j = res.value;
+    if (j.image) continue;
+
+    const keep = tgt.oldDoc;
+    const hasDiff = !!j.diffAvailable;
+    const newCur = Math.max(1, Math.min(keep.cur || 1, j.total));
+
+    let diffMode = null;
+    if (hasDiff) {
+      if (keep.diffDismissed) {
+        diffMode = null;
+      } else if (keep.diffMode) {
+        diffMode = keep.diffMode;
+      } else {
+        diffMode = layoutPref() || 'split';
+      }
+    }
+
+    const d = {
+      path: tgt.path,
+      name: tgt.path.split('/').pop(),
+      lang: j.lang,
+      total: j.total,
+      maxCols: j.maxCols,
+      size: j.size,
+      lines: new Array(j.total),
+      chunks: new Set([tgt.start / CHUNK]),
+      pending: new Set(),
+      refining: new Set(),
+      scrollTop: keep.scrollTop || 0,
+      cur: newCur,
+      col: keep.col || 0,
+      outline: null,
+      gen: 0,
+      markdown: !!j.markdown,
+      mdScroll: keep.mdScroll || 0,
+      gutter: null,
+      diffMode,
+      diffAvailable: hasDiff,
+      diffDismissed: !!keep.diffDismissed,
+    };
+
+    for (let k = 0; k < j.lines.length; k++) {
+      d.lines[j.start + k] = j.lines[k];
+    }
+    d.lsp = j.lsp || { state: 'off', server: '' };
+
+    S.tabs[idx] = d;
+    if (j.refine) refineChunk(d, tgt.start / CHUNK);
+    loadGutter(d);
+  }
+
+  const d = doc_();
+  if (d) {
+    S.lsp.state = (d.lsp && d.lsp.state) || 'off';
+    S.lsp.server = (d.lsp && d.lsp.server) || '';
+    S.lsp.missing = (d.lsp && d.lsp.missing) || '';
+    warmLSP(d);
+    syncPreview();
+    syncDiffView();
+    layout();
+    vp.scrollTop = d.scrollTop;
+    render();
+    if ($('#panel-outline')?.classList.contains('active')) loadOutline();
+  }
+
+  drawTabs();
+  drawCrumbs();
+  updateStatus();
 }
 
 export function centerLine(n) {
